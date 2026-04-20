@@ -367,15 +367,25 @@ class NeighborCooccurrenceEncoder(nn.Module):
             # dictionary, store the mapping relation from unique neighbor id to its appearances for the destination node
             dst_mapping_dict = dict(zip(dst_unique_keys, dst_counts))
 
-            # we need to use copy() to avoid the modification of src_padded_node_neighbor_ids
-            # Tensor, shape (src_max_seq_length, )
-            src_padded_node_neighbor_counts_in_dst = torch.from_numpy(src_padded_node_neighbor_ids.copy()).apply_(lambda neighbor_id: dst_mapping_dict.get(neighbor_id, 0.0)).float().to(self.device)
+            # build the cross-sequence appearance counts with an explicit integer array
+            # to avoid apply_() type issues on integer tensors
+            src_padded_node_neighbor_counts_in_dst = torch.from_numpy(
+                np.fromiter(
+                    (dst_mapping_dict.get(neighbor_id, 0) for neighbor_id in src_padded_node_neighbor_ids),
+                    dtype=np.int64,
+                    count=len(src_padded_node_neighbor_ids),
+                )
+            ).float().to(self.device)
             # Tensor, shape (src_max_seq_length, 2)
             src_padded_nodes_appearances.append(torch.stack([src_padded_node_neighbor_counts_in_src, src_padded_node_neighbor_counts_in_dst], dim=1))
 
-            # we need to use copy() to avoid the modification of dst_padded_node_neighbor_ids
-            # Tensor, shape (dst_max_seq_length, )
-            dst_padded_node_neighbor_counts_in_src = torch.from_numpy(dst_padded_node_neighbor_ids.copy()).apply_(lambda neighbor_id: src_mapping_dict.get(neighbor_id, 0.0)).float().to(self.device)
+            dst_padded_node_neighbor_counts_in_src = torch.from_numpy(
+                np.fromiter(
+                    (src_mapping_dict.get(neighbor_id, 0) for neighbor_id in dst_padded_node_neighbor_ids),
+                    dtype=np.int64,
+                    count=len(dst_padded_node_neighbor_ids),
+                )
+            ).float().to(self.device)
             # Tensor, shape (dst_max_seq_length, 2)
             dst_padded_nodes_appearances.append(torch.stack([dst_padded_node_neighbor_counts_in_src, dst_padded_node_neighbor_counts_in_dst], dim=1))
 
