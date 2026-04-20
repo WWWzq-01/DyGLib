@@ -2,6 +2,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import random
 import pandas as pd
+from pathlib import Path
 
 
 class CustomizedDataset(Dataset):
@@ -64,6 +65,117 @@ class Data:
         self.num_unique_nodes = len(self.unique_node_ids)
 
 
+def _processed_dataset_dir(dataset_name: str) -> Path:
+    return Path("./processed_data") / dataset_name
+
+
+def _make_data(
+    src_node_ids: np.ndarray,
+    dst_node_ids: np.ndarray,
+    node_interact_times: np.ndarray,
+    edge_ids: np.ndarray,
+    labels: np.ndarray,
+    mask: np.ndarray,
+):
+    return Data(
+        src_node_ids=src_node_ids[mask],
+        dst_node_ids=dst_node_ids[mask],
+        node_interact_times=node_interact_times[mask],
+        edge_ids=edge_ids[mask],
+        labels=labels[mask],
+    )
+
+
+def _load_benchmark_features(raw_dir: Path, edge_count: int):
+    node_path = raw_dir / "nfeats.npy"
+    if not node_path.exists():
+        raise FileNotFoundError(str(node_path))
+
+    node_raw_features = np.load(node_path)
+    node_zero_padding = np.zeros((1, node_raw_features.shape[1]), dtype=node_raw_features.dtype)
+    node_raw_features = np.concatenate([node_zero_padding, node_raw_features], axis=0)
+
+    edge_path = raw_dir / "efeats.npy"
+    if edge_path.exists():
+        edge_raw_features = np.load(edge_path)
+        edge_zero_padding = np.zeros((1, edge_raw_features.shape[1]), dtype=edge_raw_features.dtype)
+        edge_raw_features = np.concatenate([edge_zero_padding, edge_raw_features], axis=0)
+    else:
+        edge_raw_features = np.zeros((edge_count + 1, 1), dtype=np.float32)
+
+    return node_raw_features, edge_raw_features
+
+
+def _load_link_prediction_frame(dataset_name: str):
+    dataset_dir = _processed_dataset_dir(dataset_name)
+    processed_csv = dataset_dir / f"ml_{dataset_name}.csv"
+    processed_edge_path = dataset_dir / f"ml_{dataset_name}.npy"
+    processed_node_path = dataset_dir / f"ml_{dataset_name}_node.npy"
+
+    if processed_csv.exists() and processed_edge_path.exists() and processed_node_path.exists():
+        graph_df = pd.read_csv(processed_csv)
+        edge_raw_features = np.load(processed_edge_path)
+        node_raw_features = np.load(processed_node_path)
+        return graph_df, edge_raw_features, node_raw_features
+
+    raw_csv = dataset_dir / "edges.csv"
+    if not raw_csv.exists():
+        raise FileNotFoundError(str(processed_csv))
+
+    raw_df = pd.read_csv(raw_csv)
+    graph_df = pd.DataFrame(
+        {
+            "u": raw_df["src"].astype(np.longlong) + 1,
+            "i": raw_df["dst"].astype(np.longlong) + 1,
+            "ts": raw_df["time"].astype(np.float64),
+            "label": np.zeros(len(raw_df), dtype=np.float32),
+            "idx": np.arange(1, len(raw_df) + 1, dtype=np.longlong),
+        }
+    )
+    if "ext_roll" in raw_df.columns:
+        graph_df["ext_roll"] = raw_df["ext_roll"].astype(np.int64)
+    node_raw_features, edge_raw_features = _load_benchmark_features(dataset_dir, edge_count=len(raw_df))
+    return graph_df, edge_raw_features, node_raw_features
+
+
+def _official_link_prediction_split(
+    graph_df: pd.DataFrame,
+    src_node_ids: np.ndarray,
+    dst_node_ids: np.ndarray,
+    node_interact_times: np.ndarray,
+    edge_ids: np.ndarray,
+    labels: np.ndarray,
+):
+    ext_roll = graph_df["ext_roll"].values.astype(np.int64)
+    train_mask = ext_roll == 0
+    val_mask = ext_roll == 1
+    test_mask = ext_roll >= 2
+
+    full_data = Data(
+        src_node_ids=src_node_ids,
+        dst_node_ids=dst_node_ids,
+        node_interact_times=node_interact_times,
+        edge_ids=edge_ids,
+        labels=labels,
+    )
+    train_data = _make_data(src_node_ids, dst_node_ids, node_interact_times, edge_ids, labels, train_mask)
+    val_data = _make_data(src_node_ids, dst_node_ids, node_interact_times, edge_ids, labels, val_mask)
+    test_data = _make_data(src_node_ids, dst_node_ids, node_interact_times, edge_ids, labels, test_mask)
+
+    node_set = set(src_node_ids) | set(dst_node_ids)
+    train_node_set = set(train_data.src_node_ids).union(train_data.dst_node_ids)
+    new_node_set = node_set - train_node_set
+    edge_contains_new_node_mask = np.array(
+        [(src_node_id in new_node_set or dst_node_id in new_node_set) for src_node_id, dst_node_id in zip(src_node_ids, dst_node_ids)]
+    )
+    new_node_val_mask = np.logical_and(val_mask, edge_contains_new_node_mask)
+    new_node_test_mask = np.logical_and(test_mask, edge_contains_new_node_mask)
+    new_node_val_data = _make_data(src_node_ids, dst_node_ids, node_interact_times, edge_ids, labels, new_node_val_mask)
+    new_node_test_data = _make_data(src_node_ids, dst_node_ids, node_interact_times, edge_ids, labels, new_node_test_mask)
+
+    return full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data, len(new_node_set)
+
+
 def get_link_prediction_data(dataset_name: str, val_ratio: float, test_ratio: float):
     """
     generate data for link prediction task (inductive & transductive settings)
@@ -74,31 +186,41 @@ def get_link_prediction_data(dataset_name: str, val_ratio: float, test_ratio: fl
             full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data, (Data object)
     """
     # Load data and train val test split
-    graph_df = pd.read_csv('./processed_data/{}/ml_{}.csv'.format(dataset_name, dataset_name))
-    edge_raw_features = np.load('./processed_data/{}/ml_{}.npy'.format(dataset_name, dataset_name))
-    node_raw_features = np.load('./processed_data/{}/ml_{}_node.npy'.format(dataset_name, dataset_name))
-
-    NODE_FEAT_DIM = EDGE_FEAT_DIM = 172
-    assert NODE_FEAT_DIM >= node_raw_features.shape[1], f'Node feature dimension in dataset {dataset_name} is bigger than {NODE_FEAT_DIM}!'
-    assert EDGE_FEAT_DIM >= edge_raw_features.shape[1], f'Edge feature dimension in dataset {dataset_name} is bigger than {EDGE_FEAT_DIM}!'
-    # padding the features of edges and nodes to the same dimension (172 for all the datasets)
-    if node_raw_features.shape[1] < NODE_FEAT_DIM:
-        node_zero_padding = np.zeros((node_raw_features.shape[0], NODE_FEAT_DIM - node_raw_features.shape[1]))
-        node_raw_features = np.concatenate([node_raw_features, node_zero_padding], axis=1)
-    if edge_raw_features.shape[1] < EDGE_FEAT_DIM:
-        edge_zero_padding = np.zeros((edge_raw_features.shape[0], EDGE_FEAT_DIM - edge_raw_features.shape[1]))
-        edge_raw_features = np.concatenate([edge_raw_features, edge_zero_padding], axis=1)
-
-    assert NODE_FEAT_DIM == node_raw_features.shape[1] and EDGE_FEAT_DIM == edge_raw_features.shape[1], 'Unaligned feature dimensions after feature padding!'
-
-    # get the timestamp of validate and test set
-    val_time, test_time = list(np.quantile(graph_df.ts, [(1 - val_ratio - test_ratio), (1 - test_ratio)]))
+    graph_df, edge_raw_features, node_raw_features = _load_link_prediction_frame(dataset_name)
 
     src_node_ids = graph_df.u.values.astype(np.longlong)
     dst_node_ids = graph_df.i.values.astype(np.longlong)
     node_interact_times = graph_df.ts.values.astype(np.float64)
     edge_ids = graph_df.idx.values.astype(np.longlong)
     labels = graph_df.label.values
+
+    if "ext_roll" in graph_df.columns:
+        full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data, num_new_nodes = _official_link_prediction_split(
+            graph_df=graph_df,
+            src_node_ids=src_node_ids,
+            dst_node_ids=dst_node_ids,
+            node_interact_times=node_interact_times,
+            edge_ids=edge_ids,
+            labels=labels,
+        )
+
+        print("The dataset has {} interactions, involving {} different nodes".format(full_data.num_interactions, full_data.num_unique_nodes))
+        print("The training dataset has {} interactions, involving {} different nodes".format(
+            train_data.num_interactions, train_data.num_unique_nodes))
+        print("The validation dataset has {} interactions, involving {} different nodes".format(
+            val_data.num_interactions, val_data.num_unique_nodes))
+        print("The test dataset has {} interactions, involving {} different nodes".format(
+            test_data.num_interactions, test_data.num_unique_nodes))
+        print("The new node validation dataset has {} interactions, involving {} different nodes".format(
+            new_node_val_data.num_interactions, new_node_val_data.num_unique_nodes))
+        print("The new node test dataset has {} interactions, involving {} different nodes".format(
+            new_node_test_data.num_interactions, new_node_test_data.num_unique_nodes))
+        print("{} nodes are unseen in the training split and are used for inductive evaluation".format(num_new_nodes))
+
+        return node_raw_features, edge_raw_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data
+
+    # get the timestamp of validate and test set
+    val_time, test_time = list(np.quantile(graph_df.ts, [(1 - val_ratio - test_ratio), (1 - test_ratio)]))
 
     full_data = Data(src_node_ids=src_node_ids, dst_node_ids=dst_node_ids, node_interact_times=node_interact_times, edge_ids=edge_ids, labels=labels)
 

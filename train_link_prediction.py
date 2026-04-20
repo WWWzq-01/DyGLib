@@ -2,6 +2,7 @@ import logging
 import time
 import sys
 import os
+import csv
 from tqdm import tqdm
 import numpy as np
 import warnings
@@ -9,6 +10,7 @@ import shutil
 import json
 import torch
 import torch.nn as nn
+from pathlib import Path
 
 from models.TGAT import TGAT
 from models.MemoryModel import MemoryModel, compute_src_dst_node_time_shifts
@@ -25,12 +27,46 @@ from utils.DataLoader import get_idx_data_loader, get_link_prediction_data
 from utils.EarlyStopping import EarlyStopping
 from utils.load_configs import get_link_prediction_args
 
+
+def dump_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def write_epoch_metrics(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "epoch",
+        "train_loss",
+        "train_ap",
+        "train_auc",
+        "val_loss",
+        "val_ap",
+        "val_auc",
+        "test_loss",
+        "test_ap",
+        "test_auc",
+        "train_wall_s",
+        "epoch_wall_s",
+        "cumulative_train_wall_s",
+        "cumulative_epoch_wall_s",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 if __name__ == "__main__":
 
     warnings.filterwarnings('ignore')
 
     # get arguments
     args = get_link_prediction_args(is_evaluation=False)
+    report_dir = Path(args.report_dir).resolve() if args.report_dir else None
+    if report_dir is not None:
+        report_dir.mkdir(parents=True, exist_ok=True)
 
     # get data for training, validation and testing
     node_raw_features, edge_raw_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data = \
@@ -64,9 +100,10 @@ if __name__ == "__main__":
 
     for run in range(args.num_runs):
 
-        set_random_seed(seed=run)
+        run_seed = args.seed + run
+        set_random_seed(seed=run_seed)
 
-        args.seed = run
+        args.seed = run_seed
         args.save_model_name = f'{args.model_name}_seed{args.seed}'
 
         # set up logger
@@ -138,12 +175,28 @@ if __name__ == "__main__":
         shutil.rmtree(save_model_folder, ignore_errors=True)
         os.makedirs(save_model_folder, exist_ok=True)
 
-        early_stopping = EarlyStopping(patience=args.patience, save_model_folder=save_model_folder,
-                                       save_model_name=args.save_model_name, logger=logger, model_name=args.model_name)
+        early_stopping = EarlyStopping(
+            patience=max(args.patience, 1),
+            save_model_folder=save_model_folder,
+            save_model_name=args.save_model_name,
+            logger=logger,
+            model_name=args.model_name,
+        )
 
         loss_func = nn.BCELoss()
+        best_epoch = None
+        best_epoch_index = -1
+        best_val_ap = None
+        best_val_auc = None
+        best_test_ap = None
+        best_test_auc = None
+        stop_reason = "max_epochs"
+        cumulative_train_wall_s = 0.0
+        cumulative_epoch_wall_s = 0.0
+        epoch_history = []
 
         for epoch in range(args.num_epochs):
+            epoch_start_time = time.time()
 
             model.train()
             if args.model_name in ['DyRep', 'TGAT', 'TGN', 'CAWN', 'TCL', 'GraphMixer', 'DyGFormer']:
@@ -262,6 +315,8 @@ if __name__ == "__main__":
                     # detach the memories and raw messages of nodes in the memory bank after each batch, so we don't back propagate to the start of time
                     model[0].memory_bank.detach_memory_bank()
 
+            train_wall_s = time.time() - epoch_start_time
+
             if args.model_name in ['JODIE', 'DyRep', 'TGN']:
                 # backup memory bank after training so it can be used for new validation nodes
                 train_backup_memory_bank = model[0].memory_bank.backup_memory_bank()
@@ -308,6 +363,13 @@ if __name__ == "__main__":
             for metric_name in new_node_val_metrics[0].keys():
                 logger.info(f'new node validate {metric_name}, {np.mean([new_node_val_metric[metric_name] for new_node_val_metric in new_node_val_metrics]):.4f}')
 
+            train_ap = np.mean([train_metric['average_precision'] for train_metric in train_metrics])
+            train_auc = np.mean([train_metric['roc_auc'] for train_metric in train_metrics])
+            val_ap = np.mean([val_metric['average_precision'] for val_metric in val_metrics])
+            val_auc = np.mean([val_metric['roc_auc'] for val_metric in val_metrics])
+            test_loss_value = None
+            test_ap = None
+            test_auc = None
             # perform testing once after test_interval_epochs
             if (epoch + 1) % args.test_interval_epochs == 0:
                 test_losses, test_metrics = evaluate_model_link_prediction(model_name=args.model_name,
@@ -345,14 +407,55 @@ if __name__ == "__main__":
                 logger.info(f'new node test loss: {np.mean(new_node_test_losses):.4f}')
                 for metric_name in new_node_test_metrics[0].keys():
                     logger.info(f'new node test {metric_name}, {np.mean([new_node_test_metric[metric_name] for new_node_test_metric in new_node_test_metrics]):.4f}')
+                test_loss_value = np.mean(test_losses)
+                test_ap = np.mean([test_metric['average_precision'] for test_metric in test_metrics])
+                test_auc = np.mean([test_metric['roc_auc'] for test_metric in test_metrics])
 
-            # select the best model based on all the validate metrics
-            val_metric_indicator = []
-            for metric_name in val_metrics[0].keys():
-                val_metric_indicator.append((metric_name, np.mean([val_metric[metric_name] for val_metric in val_metrics]), True))
-            early_stop = early_stopping.step(val_metric_indicator, model)
+            epoch_wall_s = time.time() - epoch_start_time
+            cumulative_train_wall_s += train_wall_s
+            cumulative_epoch_wall_s += epoch_wall_s
+            epoch_history.append(
+                {
+                    "epoch": epoch + 1,
+                    "train_loss": np.mean(train_losses),
+                    "train_ap": train_ap,
+                    "train_auc": train_auc,
+                    "val_loss": np.mean(val_losses),
+                    "val_ap": val_ap,
+                    "val_auc": val_auc,
+                    "test_loss": test_loss_value,
+                    "test_ap": test_ap,
+                    "test_auc": test_auc,
+                    "train_wall_s": train_wall_s,
+                    "epoch_wall_s": epoch_wall_s,
+                    "cumulative_train_wall_s": cumulative_train_wall_s,
+                    "cumulative_epoch_wall_s": cumulative_epoch_wall_s,
+                }
+            )
 
-            if early_stop:
+            improved = False
+            if best_val_ap is None or val_ap > best_val_ap + args.early_stop_min_delta:
+                improved = True
+            elif best_val_ap is not None and abs(val_ap - best_val_ap) <= 1e-12:
+                improved = best_val_auc is None or val_auc > best_val_auc
+
+            if improved:
+                best_epoch = epoch + 1
+                best_epoch_index = epoch
+                best_val_ap = val_ap
+                best_val_auc = val_auc
+                if test_ap is not None:
+                    best_test_ap = test_ap
+                    best_test_auc = test_auc
+                early_stopping.save_checkpoint(model)
+
+            if (
+                args.patience > 0
+                and epoch + 1 >= args.min_epoch_before_stop
+                and best_epoch_index >= 0
+                and epoch > best_epoch_index + args.patience
+            ):
+                stop_reason = "early_stop"
                 break
 
         # load the best model
@@ -473,6 +576,48 @@ if __name__ == "__main__":
 
         with open(save_result_path, 'w') as file:
             file.write(result_json)
+
+        if report_dir is not None and run == args.num_runs - 1:
+            dump_json(
+                report_dir / "summary.json",
+                {
+                    "dataset": args.dataset_name,
+                    "model": args.model_name,
+                    "seed": args.seed,
+                    "epochs_requested": args.num_epochs,
+                    "completed_epochs": len(epoch_history),
+                    "best_epoch": best_epoch,
+                    "best_val_ap": best_val_ap,
+                    "best_val_auc": best_val_auc,
+                    "final_test_metrics": {
+                        "ap": test_metric_dict.get("average_precision"),
+                        "auc_or_mrr": test_metric_dict.get("roc_auc"),
+                    },
+                    "stop_reason": stop_reason,
+                    "config": {
+                        "dataset_name": args.dataset_name,
+                        "batch_size": args.batch_size,
+                        "learning_rate": args.learning_rate,
+                        "dropout": args.dropout,
+                        "num_epochs": args.num_epochs,
+                        "num_neighbors": args.num_neighbors,
+                        "num_layers": args.num_layers,
+                        "num_heads": args.num_heads,
+                        "patch_size": args.patch_size,
+                        "max_input_sequence_length": args.max_input_sequence_length,
+                    },
+                    "paths": {
+                        "saved_model_folder": save_model_folder,
+                        "saved_result_path": save_result_path,
+                    },
+                    "wall_seconds": {
+                        "train": single_run_time,
+                    },
+                    "total_train_only_s": cumulative_train_wall_s,
+                    "total_e2e_s": cumulative_epoch_wall_s,
+                },
+            )
+            write_epoch_metrics(report_dir / "epoch_metrics.csv", epoch_history)
 
     # store the average metrics at the log of the last run
     logger.info(f'metrics over {args.num_runs} runs:')
