@@ -1,0 +1,10 @@
+{
+  "dataset": "lastfm",
+  "target_dir": "/home/phc/data/lastfm",
+  "link_path": "/home/wzq/TGN-benchmark/systems/DyGFormer/processed_data/lastfm",
+  "link_action": "kept",
+  "has_nfeats": true,
+  "has_efeats": true,
+  "has_ext_roll": true,
+  "wall_sec": 0.00022706601885147393
+}

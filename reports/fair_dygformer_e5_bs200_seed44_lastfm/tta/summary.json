@@ -1,0 +1,54 @@
+{
+  "dataset": "lastfm",
+  "model": "DyGFormer",
+  "seed": 44,
+  "epochs_requested": 5,
+  "completed_epochs": 5,
+  "best_epoch": 2,
+  "best_val_ap": 0.9061669536712202,
+  "best_val_auc": 0.9085306814513455,
+  "final_test_metrics": {
+    "ap": 0.9147233817676239,
+    "auc_or_mrr": 0.9159739980721544
+  },
+  "stop_reason": "max_epochs",
+  "config": {
+    "dataset_name": "lastfm",
+    "batch_size": 200,
+    "learning_rate": 0.0001,
+    "dropout": 0.1,
+    "num_epochs": 5,
+    "num_neighbors": 20,
+    "num_layers": 2,
+    "num_heads": 2,
+    "patch_size": 16,
+    "max_input_sequence_length": 512
+  },
+  "paths": {
+    "saved_model_folder": "./saved_models/DyGFormer/lastfm/DyGFormer_seed44/",
+    "saved_result_path": "./saved_results/DyGFormer/lastfm/DyGFormer_seed44.json",
+    "train_log": "/home/wzq/TGN-benchmark/systems/DyGFormer/reports/fair_dygformer_e5_bs200_seed44_lastfm/tta/train.log",
+    "epoch_metrics_csv": "/home/wzq/TGN-benchmark/systems/DyGFormer/reports/fair_dygformer_e5_bs200_seed44_lastfm/tta/epoch_metrics.csv"
+  },
+  "wall_seconds": {
+    "prepare": 0.00022706601885147393,
+    "train": 10467.679392079997,
+    "total": 10467.679619146016
+  },
+  "total_train_only_s": 7104.086390733719,
+  "total_e2e_s": 9895.028050661087,
+  "system": "DyGFormer",
+  "run_type": "tta",
+  "setup": {
+    "dataset_link": {
+      "dataset": "lastfm",
+      "target_dir": "/home/phc/data/lastfm",
+      "link_path": "/home/wzq/TGN-benchmark/systems/DyGFormer/processed_data/lastfm",
+      "link_action": "kept",
+      "has_nfeats": true,
+      "has_efeats": true,
+      "has_ext_roll": true,
+      "wall_sec": 0.00022706601885147393
+    }
+  }
+}
