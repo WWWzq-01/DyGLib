@@ -111,5 +111,10 @@ ENV/
 .vscode/
 DG_data/*/*
 !DG_data/myket/*
-processed_data/*/*
+processed_data/*
+!processed_data/.gitkeep
+!processed_data/myket/
 !processed_data/myket/*
+saved_models/
+saved_results/
+reports/**/train.log
